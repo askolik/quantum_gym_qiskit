@@ -11,7 +11,7 @@ from qiskit import Aer
 from qiskit import QuantumCircuit
 from qiskit.utils import QuantumInstance
 from qiskit.circuit import Parameter
-from qiskit.opflow import StateFn, PauliSumOp, ListOp
+from qiskit.opflow import StateFn, PauliSumOp, ListOp, AerPauliExpectation, Gradient
 
 from qiskit_machine_learning.neural_networks import OpflowQNN
 from qiskit_machine_learning.connectors import TorchConnector
@@ -19,6 +19,8 @@ from qiskit_machine_learning.connectors import TorchConnector
 from torch import Tensor
 from torch.nn import Parameter as TorchParameter
 from torch.optim import Adam
+
+from time import time
 
 
 def build_quantum_model(n_qubits, n_layers):
@@ -48,9 +50,6 @@ def build_quantum_model(n_qubits, n_layers):
         circuit.ry(var_param_y, qubit)
         circuit.rz(var_param_z, qubit)
 
-    # circuit.draw(output='mpl', filename='my_circuit.png')
-    print(circuit)
-
     return circuit, trainable_params, data_params
 
 
@@ -63,7 +62,7 @@ def build_readout_ops(agent):
         ~StateFn(action_right) @ StateFn(agent)
     ])
 
-    return readout_op
+    return readout_op, action_left, action_right
 
 
 def compute_q_vals(states, model, observable_weights, grad=True):
@@ -83,10 +82,6 @@ def compute_q_vals(states, model, observable_weights, grad=True):
 
     q_vals[:, 0] *= observable_weights[0]
     q_vals[:, 1] *= observable_weights[1]
-
-    # print("Q0", q_vals[:, 0], observable_weights[0])
-    # print("Q1", q_vals[:, 1], observable_weights[1])
-
     return q_vals
 
 
@@ -101,9 +96,6 @@ def train_step(
         observables_optimizer,
         loss,
         gamma):
-    model_optimizer.zero_grad()
-    observables_optimizer.zero_grad()
-
     transitions = random.sample(memory, batch_size)
     batch_memories = Transition(*zip(*transitions))
     batch_states = batch_memories.state
@@ -117,6 +109,9 @@ def train_step(
     for action in batch_actions:
         action_masks.append(one_hot_actions[action])
 
+    model_optimizer.zero_grad()
+    observables_optimizer.zero_grad()
+
     q_vals = compute_q_vals(
         batch_states, model, observable_weights)
     q_vals_next = compute_q_vals(
@@ -127,7 +122,9 @@ def train_step(
     reduced_q_vals = torch.sum(q_vals * torch.Tensor(action_masks), dim=1)
 
     error = loss(reduced_q_vals, target_q_vals)
+    print('start backward()')
     error.backward()
+    print('end backward()')
     model_optimizer.step()
     observables_optimizer.step()
 
@@ -140,7 +137,6 @@ env = gym.make("CartPole-v0")
 # set hyperparameters for deep Q-learning
 n_qubits = 4
 n_layers = 5
-batch_size = 16
 
 gamma = 0.99  # Q-learning discount factor
 epsilon = 1.0  # epsilon greedy policy initial value
@@ -158,24 +154,32 @@ Transition = namedtuple('Transition', (
 max_memory_len = 10000
 replay_memory = deque(maxlen=max_memory_len)
 
-grad_method ='param_shift'
-# grad_method ='fin_diff'
+grad_method='param_shift'
+# grad_method='fin_diff'
+
 
 # set up model
 agent, params, data_params = build_quantum_model(n_qubits, n_layers)
 observable_weights = TorchParameter(Tensor([1, 1]))
-readout_op = build_readout_ops(agent)
-qnn = OpflowQNN(
-    readout_op, data_params, params, quantum_instance=quantum_instance)
-model = TorchConnector(qnn)
+readout_op, action_left, action_right = build_readout_ops(agent)
+qnn_opflow = OpflowQNN(
+    readout_op, data_params, params, exp_val=AerPauliExpectation(),
+    gradient=Gradient(grad_method),
+    quantum_instance=quantum_instance, input_gradients=False)
+
+model = TorchConnector(qnn_opflow)
 
 # set up target model that is used to compute target Q-values
 # (not trained, only updated with Q-model's parameters at fixed intervals)
 target_agent, target_params, target_data_params = build_quantum_model(n_qubits, n_layers)
 target_observable_weights = Tensor([1, 1])
-target_readout_op = build_readout_ops(target_agent)
+target_readout_op, _, _ = build_readout_ops(target_agent)
 target_qnn = OpflowQNN(
-    target_readout_op, target_data_params, target_params, quantum_instance=quantum_instance)
+    target_readout_op, target_data_params, target_params, exp_val=AerPauliExpectation(),
+    gradient=Gradient(grad_method),
+    quantum_instance=quantum_instance)
+
+target_qnn.input_gradients = False
 target_model = TorchConnector(target_qnn)
 target_model.load_state_dict(model.state_dict())
 
@@ -186,10 +190,17 @@ loss = torch.nn.SmoothL1Loss()
 
 episode_rewards = [0]
 
+print('start training')
+t_start_training = time()
+
 for episode in range(n_episodes):
+    t_start_episode = time()
     episode_reward = 0
     state = env.reset()
     for time_step in range(200):
+
+        print(f'episode {episode}, time_step {time_step}')
+
         # choose action based on epsilon greedy policy
         if random.random() > epsilon:
             with torch.no_grad():
@@ -232,7 +243,12 @@ for episode in range(n_episodes):
     episode_rewards.append(episode_reward)
     epsilon = max(epsilon_min, epsilon * epsilon_decay)
 
+    t_end_episode = time()
+    print('episode time:', (t_end_episode - t_start_episode))
     print(f'Episode {episode}, episode reward: {episode_reward}, average reward: {np.mean(episode_rewards[-100:])}')
+
+t_end_training = time()
+print('training time:', (t_end_training - t_start_training))
 
 plt.plot(episode_rewards)
 plt.ylabel("Score")
