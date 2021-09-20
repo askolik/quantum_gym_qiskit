@@ -27,11 +27,11 @@ def build_quantum_model(n_qubits, n_layers):
     circuit = QuantumCircuit(n_qubits)
     data_params = [Parameter(f'x_{i}') for i in range(n_qubits)]
     data_weight_params = [Parameter(f'd_{i}') for i in range(n_qubits)]
-    trainable_params = data_weight_params
+    trainable_params = []
 
     for layer in range(n_layers):
         for qubit in range(n_qubits):
-            circuit.rx(data_params[qubit] * data_weight_params[qubit], qubit)
+            circuit.rx(data_params[qubit], qubit)
             var_param_y = Parameter(f't_y_{layer}_{qubit}')
             var_param_z = Parameter(f't_z_{layer}_{qubit}')
             trainable_params += [var_param_y, var_param_z]
@@ -50,7 +50,7 @@ def build_quantum_model(n_qubits, n_layers):
         circuit.ry(var_param_y, qubit)
         circuit.rz(var_param_z, qubit)
 
-    return circuit, trainable_params, data_params
+    return circuit, trainable_params, data_params, data_weight_params
 
 
 def build_readout_ops(agent):
@@ -65,12 +65,12 @@ def build_readout_ops(agent):
     return readout_op, action_left, action_right
 
 
-def compute_q_vals(states, model, observable_weights, grad=True):
+def compute_q_vals(states, model, observable_weights, data_weights, grad=True):
     scaled_states = []
     for state in states:
         scaled_states.append([np.arctan(s) for s in state])
 
-    states_tensor = Tensor(states)
+    states_tensor = Tensor(states) * data_weights
     if grad:
         print('batch size:', len(states_tensor))
         res = model(states_tensor)
@@ -91,9 +91,12 @@ def train_step(
         target_model,
         batch_size,
         observable_weights,
+        data_weights,
         target_observable_weights,
+        target_data_weights,
         model_optimizer,
         observables_optimizer,
+        data_weights_optimizer,
         loss,
         gamma):
     transitions = random.sample(memory, batch_size)
@@ -111,11 +114,12 @@ def train_step(
 
     model_optimizer.zero_grad()
     observables_optimizer.zero_grad()
+    data_weights_optimizer.zero_grad()
 
     q_vals = compute_q_vals(
-        batch_states, model, observable_weights)
+        batch_states, model, observable_weights, data_weights)
     q_vals_next = compute_q_vals(
-        batch_next_states, target_model, target_observable_weights, grad=False)
+        batch_next_states, target_model, target_observable_weights, target_data_weights, grad=False)
 
     target_q_vals = torch.Tensor(batch_rewards) + torch.Tensor(
         np.ones(batch_size) * gamma) * torch.max(q_vals_next, 1).values * (1 - torch.Tensor(batch_done))
@@ -127,6 +131,7 @@ def train_step(
     print('end backward()')
     model_optimizer.step()
     observables_optimizer.step()
+    data_weights_optimizer.step()
 
 
 # set up Qiskit backend and Gym
@@ -159,8 +164,9 @@ grad_method='param_shift'
 
 
 # set up model
-agent, params, data_params = build_quantum_model(n_qubits, n_layers)
+agent, params, data_params, data_weight_params = build_quantum_model(n_qubits, n_layers)
 observable_weights = TorchParameter(Tensor([1, 1]))
+data_weights = TorchParameter(Tensor([1, 1, 1, 1]))
 readout_op, action_left, action_right = build_readout_ops(agent)
 qnn_opflow = OpflowQNN(
     readout_op, data_params, params, exp_val=AerPauliExpectation(),
@@ -171,8 +177,9 @@ model = TorchConnector(qnn_opflow)
 
 # set up target model that is used to compute target Q-values
 # (not trained, only updated with Q-model's parameters at fixed intervals)
-target_agent, target_params, target_data_params = build_quantum_model(n_qubits, n_layers)
+target_agent, target_params, target_data_params, target_data_weight_params = build_quantum_model(n_qubits, n_layers)
 target_observable_weights = Tensor([1, 1])
+target_data_weights = TorchParameter(Tensor([1, 1, 1, 1]))
 target_readout_op, _, _ = build_readout_ops(target_agent)
 target_qnn = OpflowQNN(
     target_readout_op, target_data_params, target_params, exp_val=AerPauliExpectation(),
@@ -186,9 +193,10 @@ target_model.load_state_dict(model.state_dict())
 # set up optimizers
 model_optimizer = Adam(model.parameters(), lr=0.001)
 observables_optimizer = Adam([observable_weights], lr=0.1)
-loss = torch.nn.SmoothL1Loss()
+data_weights_optimizer = Adam([data_weights], lr=0.1)
+loss = torch.nn.MSELoss()
 
-episode_rewards = [0]
+episode_rewards = []
 
 print('start training')
 t_start_training = time()
@@ -225,9 +233,12 @@ for episode in range(n_episodes):
                 target_model,
                 batch_size,
                 observable_weights,
+                data_weights,
                 target_observable_weights,
+                target_data_weights,
                 model_optimizer,
                 observables_optimizer,
+                data_weights_optimizer,
                 loss,
                 gamma)
 
@@ -236,6 +247,7 @@ for episode in range(n_episodes):
             with torch.no_grad():
                 target_model.load_state_dict(model.state_dict())
                 target_observable_weights = copy.deepcopy(observable_weights.data)
+                target_data_weights = copy.deepcopy(data_weights.data)
 
         if done:
             break
@@ -245,7 +257,11 @@ for episode in range(n_episodes):
 
     t_end_episode = time()
     print('episode time:', (t_end_episode - t_start_episode))
-    print(f'Episode {episode}, episode reward: {episode_reward}, average reward: {np.mean(episode_rewards[-100:])}')
+
+    if episode > 0:
+        print(f'Episode {episode}, episode reward: {episode_reward}, average reward: {np.mean(episode_rewards[-100:])}')
+    else:
+        print(f'Episode {episode}, episode reward: {episode_reward}')
 
 t_end_training = time()
 print('training time:', (t_end_training - t_start_training))
