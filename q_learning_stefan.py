@@ -26,12 +26,12 @@ from time import time
 def build_quantum_model(n_qubits, n_layers):
     circuit = QuantumCircuit(n_qubits)
     data_params = [Parameter(f'x_{i}') for i in range(n_qubits)]
-    data_weight_params = [Parameter(f'd_{i}') for i in range(n_qubits)]
+    data_weight_params = [[Parameter(f'd_{j}_{i}') for i in range(n_qubits)] for j in range(n_layers)]
     trainable_params = []
 
     for layer in range(n_layers):
         for qubit in range(n_qubits):
-            circuit.rx(data_params[qubit], qubit)
+            circuit.rx(data_params[qubit] * data_weight_params[layer][qubit], qubit)
             var_param_y = Parameter(f't_y_{layer}_{qubit}')
             var_param_z = Parameter(f't_z_{layer}_{qubit}')
             trainable_params += [var_param_y, var_param_z]
@@ -65,12 +65,12 @@ def build_readout_ops(agent):
     return readout_op, action_left, action_right
 
 
-def compute_q_vals(states, model, observable_weights, data_weights, grad=True):
+def compute_q_vals(states, model, observable_weights, grad=True):
     scaled_states = []
     for state in states:
         scaled_states.append([np.arctan(s) for s in state])
 
-    states_tensor = Tensor(states) * data_weights
+    states_tensor = Tensor(states)
     if grad:
         print('batch size:', len(states_tensor))
         res = model(states_tensor)
@@ -117,9 +117,9 @@ def train_step(
     data_weights_optimizer.zero_grad()
 
     q_vals = compute_q_vals(
-        batch_states, model, observable_weights, data_weights)
+        batch_states, model, observable_weights)
     q_vals_next = compute_q_vals(
-        batch_next_states, target_model, target_observable_weights, target_data_weights, grad=False)
+        batch_next_states, target_model, target_observable_weights, grad=False)
 
     target_q_vals = torch.Tensor(batch_rewards) + torch.Tensor(
         np.ones(batch_size) * gamma) * torch.max(q_vals_next, 1).values * (1 - torch.Tensor(batch_done))
@@ -166,7 +166,7 @@ grad_method='param_shift'
 # set up model
 agent, params, data_params, data_weight_params = build_quantum_model(n_qubits, n_layers)
 observable_weights = TorchParameter(Tensor([1, 1]))
-data_weights = TorchParameter(Tensor([1, 1, 1, 1]))
+data_weights = TorchParameter(Tensor([[1]*n_qubits for _ in range(n_layers)]))
 readout_op, action_left, action_right = build_readout_ops(agent)
 qnn_opflow = OpflowQNN(
     readout_op, data_params, params, exp_val=AerPauliExpectation(),
@@ -179,7 +179,7 @@ model = TorchConnector(qnn_opflow)
 # (not trained, only updated with Q-model's parameters at fixed intervals)
 target_agent, target_params, target_data_params, target_data_weight_params = build_quantum_model(n_qubits, n_layers)
 target_observable_weights = Tensor([1, 1])
-target_data_weights = TorchParameter(Tensor([1, 1, 1, 1]))
+target_data_weights = TorchParameter(Tensor([[1]*n_qubits for _ in range(n_layers)]))
 target_readout_op, _, _ = build_readout_ops(target_agent)
 target_qnn = OpflowQNN(
     target_readout_op, target_data_params, target_params, exp_val=AerPauliExpectation(),
