@@ -23,15 +23,22 @@ from torch.optim import Adam
 from time import time
 
 
-def build_quantum_model(n_qubits, n_layers):
+def build_quantum_model(n_qubits, n_layers, is_target_model=False):
+    name_prefix = ''
+    if is_target_model:
+        name_prefix = 'target_'
+
     circuit = QuantumCircuit(n_qubits)
-    data_params = [Parameter(f'x_{i}') for i in range(n_qubits)]
-    data_weight_params = [[Parameter(f'd_{j}_{i}') for i in range(n_qubits)] for j in range(n_layers)]
+    data_params = [
+        Parameter(f'{name_prefix}x_{i}_{j}') for i in range(n_qubits) for j in range(n_layers)]
+    data_params_copy = copy.deepcopy(data_params)[::-1]
+    data_weight_params = [
+        Parameter(f'{name_prefix}d_{i}_{j}') for i in range(n_qubits) for j in range(n_layers)]
     trainable_params = []
 
     for layer in range(n_layers):
         for qubit in range(n_qubits):
-            circuit.rx(data_params[qubit] * data_weight_params[layer][qubit], qubit)
+            circuit.rx(data_params.pop(), qubit)
             var_param_y = Parameter(f't_y_{layer}_{qubit}')
             var_param_z = Parameter(f't_z_{layer}_{qubit}')
             trainable_params += [var_param_y, var_param_z]
@@ -43,14 +50,10 @@ def build_quantum_model(n_qubits, n_layers):
 
         circuit.barrier()
 
-    for qubit in range(n_qubits):
-        var_param_y = Parameter(f't_y_{n_layers}_{qubit}')
-        var_param_z = Parameter(f't_z_{n_layers}_{qubit}')
-        trainable_params += [var_param_y, var_param_z]
-        circuit.ry(var_param_y, qubit)
-        circuit.rz(var_param_z, qubit)
+    # print(circuit)
+    # exit()
 
-    return circuit, trainable_params, data_params, data_weight_params
+    return circuit, trainable_params, data_params_copy, data_weight_params
 
 
 def build_readout_ops(agent):
@@ -65,14 +68,14 @@ def build_readout_ops(agent):
     return readout_op, action_left, action_right
 
 
-def compute_q_vals(states, model, observable_weights, grad=True):
-    scaled_states = []
+def compute_q_vals(states, model, observable_weights, data_weights, n_layers, grad=True):
+    input_states = []
     for state in states:
-        scaled_states.append([np.arctan(s) for s in state])
+        extended_state = torch.arctan(Tensor(state).repeat(1, n_layers) * data_weights)
+        input_states.append(extended_state)
 
-    states_tensor = Tensor(states)
+    states_tensor = torch.reshape(torch.stack(input_states), (len(input_states), n_layers*4))
     if grad:
-        print('batch size:', len(states_tensor))
         res = model(states_tensor)
     else:
         with torch.no_grad():
@@ -82,6 +85,7 @@ def compute_q_vals(states, model, observable_weights, grad=True):
 
     q_vals[:, 0] *= observable_weights[0]
     q_vals[:, 1] *= observable_weights[1]
+
     return q_vals
 
 
@@ -98,7 +102,8 @@ def train_step(
         observables_optimizer,
         data_weights_optimizer,
         loss,
-        gamma):
+        gamma,
+        n_layers):
     transitions = random.sample(memory, batch_size)
     batch_memories = Transition(*zip(*transitions))
     batch_states = batch_memories.state
@@ -117,9 +122,9 @@ def train_step(
     data_weights_optimizer.zero_grad()
 
     q_vals = compute_q_vals(
-        batch_states, model, observable_weights)
+        batch_states, model, observable_weights, data_weights, n_layers)
     q_vals_next = compute_q_vals(
-        batch_next_states, target_model, target_observable_weights, grad=False)
+        batch_next_states, target_model, target_observable_weights, target_data_weights, n_layers, grad=False)
 
     target_q_vals = torch.Tensor(batch_rewards) + torch.Tensor(
         np.ones(batch_size) * gamma) * torch.max(q_vals_next, 1).values * (1 - torch.Tensor(batch_done))
@@ -162,11 +167,13 @@ replay_memory = deque(maxlen=max_memory_len)
 grad_method='param_shift'
 # grad_method='fin_diff'
 
-
 # set up model
-agent, params, data_params, data_weight_params = build_quantum_model(n_qubits, n_layers)
+agent, params, data_params, data_weight_params = build_quantum_model(
+    n_qubits, n_layers)
+
 observable_weights = TorchParameter(Tensor([1, 1]))
-data_weights = TorchParameter(Tensor([[1]*n_qubits for _ in range(n_layers)]))
+data_weights = TorchParameter(Tensor(np.ones(shape=n_qubits*n_layers)))
+
 readout_op, action_left, action_right = build_readout_ops(agent)
 qnn_opflow = OpflowQNN(
     readout_op, data_params, params, exp_val=AerPauliExpectation(),
@@ -175,11 +182,13 @@ qnn_opflow = OpflowQNN(
 
 model = TorchConnector(qnn_opflow)
 
+
 # set up target model that is used to compute target Q-values
 # (not trained, only updated with Q-model's parameters at fixed intervals)
-target_agent, target_params, target_data_params, target_data_weight_params = build_quantum_model(n_qubits, n_layers)
+target_agent, target_params, target_data_params, target_data_weight_params = build_quantum_model(
+    n_qubits, n_layers, is_target_model=True)
 target_observable_weights = Tensor([1, 1])
-target_data_weights = TorchParameter(Tensor([[1]*n_qubits for _ in range(n_layers)]))
+target_data_weights = TorchParameter(Tensor(np.ones(shape=n_qubits*n_layers)))
 target_readout_op, _, _ = build_readout_ops(target_agent)
 target_qnn = OpflowQNN(
     target_readout_op, target_data_params, target_params, exp_val=AerPauliExpectation(),
@@ -206,15 +215,15 @@ for episode in range(n_episodes):
     episode_reward = 0
     state = env.reset()
     for time_step in range(200):
+        # env.render()
 
         print(f'episode {episode}, time_step {time_step}')
 
         # choose action based on epsilon greedy policy
         if random.random() > epsilon:
             with torch.no_grad():
-                q_vals = compute_q_vals([state], model, observable_weights)
+                q_vals = compute_q_vals([state], model, observable_weights, data_weights, n_layers)
                 action = int(torch.argmax(q_vals).numpy())
-                print("\tagent chose action")
         else:
             action = np.random.choice(2)
 
@@ -224,6 +233,7 @@ for episode in range(n_episodes):
 
         # store transition in memory (without reward as it is always 1)
         replay_memory.append(Transition(state, action, next_state, int(done)))
+        state = next_state
 
         # perform one step of parameter updates
         if len(replay_memory) > batch_size and time_step % update_qnet_after == 0:
@@ -240,7 +250,8 @@ for episode in range(n_episodes):
                 observables_optimizer,
                 data_weights_optimizer,
                 loss,
-                gamma)
+                gamma,
+                n_layers)
 
         # update target model parameters
         if time_step % update_target_after == 0:
